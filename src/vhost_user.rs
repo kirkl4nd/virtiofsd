@@ -15,7 +15,7 @@ use log::*;
 use vhost::vhost_user::message::*;
 use vhost::vhost_user::Backend;
 use vhost_user_backend::bitmap::BitmapMmapRegion;
-use vhost_user_backend::{VhostUserBackend, VringMutex, VringState, VringT};
+use vhost_user_backend::{EventSet, VhostUserBackend, VringMutex, VringState, VringT};
 use virtio_bindings::bindings::virtio_config::*;
 use virtio_bindings::bindings::virtio_ring::{
     VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC,
@@ -24,7 +24,6 @@ use virtio_queue::{DescriptorChain, QueueOwnedT};
 use vm_memory::{
     ByteValued, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap, Le32,
 };
-use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::event::{
     new_event_consumer_and_notifier, EventConsumer, EventFlag, EventNotifier,
 };
@@ -47,9 +46,9 @@ const REQUEST_QUEUES: u32 = 1;
 const NUM_QUEUES: usize = REQUEST_QUEUES as usize + 1;
 
 // The guest queued an available buffer for the high priority queue.
-const HIPRIO_QUEUE_EVENT: u16 = 0;
+const HIPRIO_QUEUE_EVENT: usize = 0;
 // The guest queued an available buffer for the request queue.
-const REQ_QUEUE_EVENT: u16 = 1;
+const REQ_QUEUE_EVENT: usize = 1;
 
 /// The maximum length of the tag being used.
 pub const MAX_TAG_LEN: usize = 36;
@@ -135,17 +134,25 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
             //
             // Note that the program is single-threaded here so this syscall has no
             // visible effect and is safe to make.
-            let ret = unsafe { libc::unshare(libc::CLONE_FS) };
-            if ret == -1 {
-                return Err(Error::UnshareCloneFs(std::io::Error::last_os_error()));
+            #[cfg(target_os = "linux")]
+            {
+                let ret = unsafe { libc::unshare(libc::CLONE_FS) };
+                if ret == -1 {
+                    return Err(Error::UnshareCloneFs(std::io::Error::last_os_error()));
+                }
             }
 
+            // macOS never changes the working directory for extended attribute operations, so
+            // its threads need no working directory of their own.
             Some(
                 ThreadPoolBuilder::new()
                     .after_start(|_| {
                         // unshare FS for xattr operation
-                        let ret = unsafe { libc::unshare(libc::CLONE_FS) };
-                        assert_eq!(ret, 0); // Should not fail
+                        #[cfg(target_os = "linux")]
+                        {
+                            let ret = unsafe { libc::unshare(libc::CLONE_FS) };
+                            assert_eq!(ret, 0); // Should not fail
+                        }
                     })
                     .pool_size(thread_pool_size)
                     .create()
@@ -287,7 +294,7 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
 
     fn handle_event_pool(
         &self,
-        device_event: u16,
+        device_event: usize,
         vrings: &[VringMutex<LoggedMemoryAtomic>],
     ) -> io::Result<()> {
         let idx = match device_event {
@@ -327,7 +334,7 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
 
     fn handle_event_serial(
         &self,
-        device_event: u16,
+        device_event: usize,
         vrings: &[VringMutex<LoggedMemoryAtomic>],
     ) -> io::Result<()> {
         let mut vring_state = match device_event {
@@ -564,12 +571,12 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserBa
 
     fn handle_event(
         &self,
-        device_event: u16,
+        device_event: usize,
         evset: EventSet,
         vrings: &[VringMutex<LoggedMemoryAtomic>],
         _thread_id: usize,
     ) -> io::Result<()> {
-        if evset != EventSet::IN {
+        if !matches!(evset, EventSet::Readable) {
             return Err(Error::HandleEventNotEpollIn.into());
         }
 

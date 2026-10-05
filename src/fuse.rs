@@ -2,7 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::convert::TryFrom;
+#[cfg(target_os = "macos")]
+use crate::libc_compat as libc;
+
+use std::convert::{TryFrom, TryInto};
 use std::io;
 
 use crate::macros::enum_value;
@@ -637,6 +640,10 @@ impl Attr {
         let uid = uid_map(HostUid::from(st.st_uid))?;
         let gid = gid_map(HostGid::from(st.st_gid))?;
 
+        fn fuse_nlink<N: TryInto<u32>>(nlink: N) -> u32 {
+            nlink.try_into().unwrap_or(u32::MAX)
+        }
+
         Ok(Attr {
             ino: st.st_ino,
             size: st.st_size as u64,
@@ -648,7 +655,7 @@ impl Attr {
             mtimensec: st.st_mtime_nsec as u32,
             ctimensec: st.st_ctime_nsec as u32,
             mode: st.st_mode,
-            nlink: st.st_nlink as u32,
+            nlink: fuse_nlink(st.st_nlink),
             uid,
             gid,
             rdev: st.st_rdev as u32,

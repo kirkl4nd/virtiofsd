@@ -4,6 +4,7 @@
 
 use log::*;
 use passthrough::xattrmap::XattrMap;
+#[cfg(target_os = "linux")]
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::ffi::CString;
@@ -22,12 +23,14 @@ use vhost::vhost_user::Listener;
 use vhost_user_backend::Error::HandleRequest;
 use vhost_user_backend::VhostUserDaemon;
 use virtiofsd::filesystem::{FileSystem, SerializableFileSystem};
+use virtiofsd::passthrough::open_flags::GuestArch;
 use virtiofsd::passthrough::read_only::PassthroughFsRo;
 use virtiofsd::passthrough::{
     self, CachePolicy, InodeFileHandlesMode, MigrationMode, MigrationOnError, NegotiationMode,
     PassthroughFs,
 };
 use virtiofsd::sandbox::{Sandbox, SandboxMode};
+#[cfg(target_os = "linux")]
 use virtiofsd::seccomp::{enable_seccomp, SeccompAction};
 use virtiofsd::util::write_pid_file;
 use virtiofsd::vhost_user::{Error, VhostUserFsBackendBuilder, MAX_TAG_LEN};
@@ -53,6 +56,7 @@ const INTERNAL_FD_RESERVE: u64 = MAX_MEM_SLOTS + 100;
 
 type Result<T> = std::result::Result<T, Error>;
 
+#[cfg(target_os = "linux")]
 fn parse_seccomp(src: &str) -> std::result::Result<SeccompAction, &'static str> {
     Ok(match src {
         "none" => SeccompAction::Allow, // i.e. no seccomp
@@ -170,8 +174,10 @@ struct Opt {
     #[arg(long, value_parser = |s: &_| XattrMap::try_from(s))]
     xattrmap: Option<XattrMap>,
 
-    /// Sandbox mechanism to isolate the daemon process (namespace, chroot, none)
-    #[arg(long, default_value = "namespace")]
+    /// Sandbox mechanism to isolate the daemon process (namespace, chroot, none; namespace is
+    /// only available on Linux)
+    #[cfg_attr(target_os = "linux", arg(long, default_value = "namespace"))]
+    #[cfg_attr(not(target_os = "linux"), arg(long, default_value = "chroot"))]
     sandbox: SandboxMode,
 
     /// Prevent the guest from making modifications to the filesystem.
@@ -179,6 +185,7 @@ struct Opt {
     readonly: bool,
 
     /// Action to take when seccomp finds a not allowed syscall (none, kill, log, trap)
+    #[cfg(target_os = "linux")]
     #[arg(long, value_parser = parse_seccomp, default_value = "kill")]
     seccomp: SeccompAction,
 
@@ -206,7 +213,16 @@ struct Opt {
     /// not only helpful with resources, but may also be important in cases where virtiofsd should
     /// only have file descriptors open for files that are open in the guest, e.g. to get around
     /// bad interactions with NFS's silly renaming.
-    #[arg(long, require_equals = true, default_value = "prefer")]
+    ///
+    /// On macOS, which has no file handles, the default is "never".
+    #[cfg_attr(
+        target_os = "linux",
+        arg(long, require_equals = true, default_value = "prefer")
+    )]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        arg(long, require_equals = true, default_value = "never")
+    )]
     inode_file_handles: InodeFileHandlesCommandLineMode,
 
     /// The caching policy the file system should use (auto, always, never, metadata)
@@ -231,11 +247,18 @@ struct Opt {
     #[arg(long)]
     allow_direct_io: bool,
 
+    /// The architecture of the guest's kernel (x86_64, aarch64). Four open flags have different
+    /// values on each, and the guest sends its own; the default, the host's architecture, is
+    /// right for any guest under hardware virtualization
+    #[arg(long = "guest-arch", default_value_t = GuestArch::HOST, value_name = "x86_64|aarch64")]
+    guest_arch: GuestArch,
+
     /// Print vhost-user.json backend program capabilities and exit
     #[arg(long = "print-capabilities")]
     print_capabilities: bool,
 
     /// Modify the list of capabilities, e.g., --modcaps=+sys_admin:-chown
+    #[cfg(target_os = "linux")]
     #[arg(long)]
     modcaps: Option<String>,
 
@@ -462,6 +485,7 @@ fn parse_compat(opt: Opt) -> Opt {
                 _ => value_error("sandbox", value),
             },
             ["source", value] => opt.shared_dir = Some(value.to_string()),
+            #[cfg(target_os = "linux")]
             ["modcaps", value] => opt.modcaps = Some(value.to_string()),
             _ => argument_error(tuple),
         }
@@ -542,21 +566,39 @@ fn initialize_logging(opt: &Opt) {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn register_signal_handler(
+    num: libc::c_int,
+    handler: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void),
+) -> std::io::Result<()> {
+    // SAFETY: an all-zero `sigaction` is valid, and every field that matters is set below.
+    let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+    act.sa_sigaction = handler as libc::sighandler_t;
+    act.sa_flags = libc::SA_SIGINFO;
+    // SAFETY: `act` is valid, and the null old action is allowed.
+    if unsafe { libc::sigaction(num, &act, std::ptr::null_mut()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn set_signal_handlers() {
-    use vmm_sys_util::signal;
+    #[cfg(target_os = "linux")]
+    use vmm_sys_util::signal::register_signal_handler;
 
     extern "C" fn handle_signal(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
         unsafe { libc::_exit(1) };
     }
     let signals = vec![libc::SIGHUP, libc::SIGTERM];
     for s in signals {
-        if let Err(e) = signal::register_signal_handler(s, handle_signal) {
+        if let Err(e) = register_signal_handler(s, handle_signal) {
             error!("Setting signal handlers: {e}");
             process::exit(1);
         }
     }
 }
 
+#[cfg(target_os = "linux")]
 fn parse_modcaps(
     default_caps: Vec<&str>,
     modcaps: Option<String>,
@@ -597,6 +639,7 @@ fn parse_modcaps(
     (required_caps, disabled_caps)
 }
 
+#[cfg(target_os = "linux")]
 fn drop_capabilities(inode_file_handles: InodeFileHandlesMode, modcaps: Option<String>) {
     let default_caps = vec![
         "CHOWN",
@@ -853,6 +896,7 @@ fn main() {
         readdirplus,
         writeback: opt.writeback,
         allow_direct_io: opt.allow_direct_io,
+        guest_arch: opt.guest_arch,
         killpriv_v2,
         security_label: opt.security_label,
         posix_acl: opt.posix_acl,
@@ -869,6 +913,7 @@ fn main() {
     };
 
     // Must happen before we start the thread pool
+    #[cfg(target_os = "linux")]
     match opt.seccomp {
         SeccompAction::Allow => {}
         _ => enable_seccomp(opt.seccomp, opt.syslog).unwrap(),
@@ -876,9 +921,12 @@ fn main() {
 
     // We don't modify the capabilities if the user call us without
     // any sandbox (i.e. --sandbox=none) as unprivileged user
-    let uid = unsafe { libc::geteuid() };
-    if uid == 0 {
-        drop_capabilities(fs_cfg.inode_file_handles, opt.modcaps);
+    #[cfg(target_os = "linux")]
+    {
+        let uid = unsafe { libc::geteuid() };
+        if uid == 0 {
+            drop_capabilities(fs_cfg.inode_file_handles, opt.modcaps);
+        }
     }
 
     if opt.readonly {

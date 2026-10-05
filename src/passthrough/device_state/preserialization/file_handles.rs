@@ -117,10 +117,17 @@ impl Constructor<'_> {
                 .err_context(|| "Failed to generate file handle")?
                 .into(),
             FileOrHandle::Handle(handle) => handle.inner().into(),
-            FileOrHandle::Invalid(err) => return Err(io::Error::new(
-                err.kind(),
-                format!("Inode is invalid because of an error during the preceding migration, which was: {err}"),
-            )),
+            #[cfg(target_os = "macos")]
+            FileOrHandle::Name(_) => {
+                return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+                    .err_context(|| "Failed to generate file handle")
+            }
+            FileOrHandle::Invalid(err) => {
+                return Err(io::Error::new(
+                    err.kind(),
+                    format!("Inode is invalid: {err}"),
+                ))
+            }
         };
 
         let mig_info = InodeMigrationInfo::new_internal(

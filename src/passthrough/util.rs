@@ -1,6 +1,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
+#[cfg(target_os = "macos")]
+use crate::libc_compat as libc;
+
 use crate::util::{other_io_error, ErrorContext, ResultErrorContext};
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -38,6 +41,7 @@ pub fn openat_verbose(dir_fd: &impl AsRawFd, path: &str, flags: libc::c_int) -> 
 
 /// Open `/proc/self/fd/{fd}` with the given flags to effectively duplicate the given `fd` with new
 /// flags (e.g. to turn an `O_PATH` file descriptor into one that can be used for I/O).
+#[cfg(target_os = "linux")]
 pub fn reopen_fd_through_proc(
     fd: &impl AsRawFd,
     flags: libc::c_int,
@@ -79,6 +83,7 @@ pub fn erofs() -> io::Error {
  * considers recoverable.
  */
 #[derive(Debug)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) enum FdPathError {
     /// `readlinkat()` failed with the contained error.
     ReadLink(io::Error),
@@ -97,6 +102,7 @@ pub(crate) enum FdPathError {
 }
 
 /// Looks up an FD's path through /proc/self/fd
+#[cfg(target_os = "linux")]
 pub(crate) fn get_path_by_fd(
     fd: &impl AsRawFd,
     proc_self_fd: &impl AsRawFd,
@@ -197,4 +203,222 @@ pub fn relative_path<'a>(path: &'a CStr, prefix: &CStr) -> io::Result<&'a CStr> 
     // Must succeed: Was a `CStr` before, converted to `&[u8]` via `to_bytes_with_nul()`, so must
     // still contain exactly one NUL byte at the end of the slice
     Ok(CStr::from_bytes_with_nul(relative_path).unwrap())
+}
+
+/// `fstat()` into the Linux-shaped `stat64`.
+#[cfg(target_os = "macos")]
+fn fstat(fd: &impl AsRawFd) -> io::Result<libc::stat64> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // Safe because this only writes to `st` and we check the return value.
+    if unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Safe because `fstat()` has initialized `st`.
+    Ok(libc::stat64::from(unsafe { &st.assume_init() }))
+}
+
+/// The path of the file `fd` refers to, from `fcntl(F_GETPATH)`.  macOS keeps the name a vnode
+/// was last reached by, so the path may be stale: anything opened by it must be checked to be
+/// the same inode as `fd`.
+#[cfg(target_os = "macos")]
+fn fd_path(fd: &impl AsRawFd) -> io::Result<CString> {
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // Safe because `F_GETPATH` writes at most `PATH_MAX` bytes into `buf`, and we check the
+    // return value.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    buf.truncate(len);
+    CString::new(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Open `path` relative to `dir` (no symbolic link may be part of it), and check that it is the
+/// inode `st` describes, or fail with `ESTALE`.  `O_TRUNC` is applied only after the check.
+#[cfg(target_os = "macos")]
+pub(crate) fn open_same_inode(
+    dir: &impl AsRawFd,
+    path: &CStr,
+    flags: libc::c_int,
+    st: &libc::stat64,
+) -> io::Result<File> {
+    let open = |flags| -> io::Result<File> {
+        let path = path
+            .to_str()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let file = openat(
+            dir,
+            path,
+            flags & !(libc::O_NOFOLLOW | libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC)
+                | libc::O_NOFOLLOW_ANY,
+        )?;
+        let new_st = fstat(&file)?;
+        if (new_st.st_dev, new_st.st_ino) != (st.st_dev, st.st_ino) {
+            return Err(io::Error::from_raw_os_error(libc::ESTALE));
+        }
+        Ok(file)
+    };
+
+    let file = open(flags)?;
+    if flags & libc::O_TRUNC != 0 {
+        if flags & libc::O_ACCMODE == libc::O_RDONLY {
+            open(libc::O_WRONLY | libc::O_CLOEXEC)?.set_len(0)?;
+        } else {
+            file.set_len(0)?;
+        }
+    }
+    Ok(file)
+}
+
+/// macOS has no `/proc/self/fd`.  A directory is reopened through its `.` entry.  Anything else
+/// is reopened by the path that `fcntl(F_GETPATH)` reports, without following symbolic links, and
+/// the result must be the same inode, or this fails with `ESTALE` (the guest then looks the file
+/// up again).  This also means that unlinked files cannot be reopened.
+#[cfg(target_os = "macos")]
+pub fn reopen_fd_through_proc(
+    fd: &impl AsRawFd,
+    flags: libc::c_int,
+    _proc_self_fd: &File,
+) -> io::Result<File> {
+    let st = fstat(fd)?;
+    if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        let flags = flags & !(libc::O_NOFOLLOW | libc::O_CREAT | libc::O_EXCL);
+        return openat(fd, ".", flags | libc::O_DIRECTORY);
+    }
+    open_same_inode(&libc::AT_FDCWD, &fd_path(fd)?, flags, &st)
+}
+
+/// macOS has no `/proc/self/fd`; get the path from `fcntl(F_GETPATH)` instead.
+#[cfg(target_os = "macos")]
+pub(crate) fn get_path_by_fd(
+    fd: &impl AsRawFd,
+    _proc_self_fd: &impl AsRawFd,
+) -> Result<CString, FdPathError> {
+    let path = fd_path(fd).map_err(FdPathError::ReadLink)?;
+    if fstat(fd).map_err(FdPathError::ReadLink)?.st_nlink == 0 {
+        return Err(FdPathError::Deleted(path.to_string_lossy().into_owned()));
+    }
+    Ok(path)
+}
+
+/// Create a hard link `newdir`/`newname` to the inode that `fd` refers to.
+///
+/// Linux links the `/proc/self/fd` entry.  macOS links the inode by the name `fcntl(F_GETPATH)`
+/// reports, relative to its parent directory, after checking that the name still is that inode.
+#[cfg(target_os = "macos")]
+pub fn link_fd_at(fd: &impl AsRawFd, newdir: &impl AsRawFd, newname: &CStr) -> io::Result<()> {
+    let st = fstat(fd)?;
+    let path = fd_path(fd)?;
+    let bytes = path.as_bytes();
+    let slash = bytes
+        .iter()
+        .rposition(|&b| b == b'/')
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
+    let parent = CString::new(if slash == 0 {
+        &b"/"[..]
+    } else {
+        &bytes[..slash]
+    })
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let name = CString::new(&bytes[slash + 1..])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let parent = openat(
+        &libc::AT_FDCWD,
+        parent
+            .to_str()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW_ANY | libc::O_CLOEXEC,
+    )?;
+    let entry = crate::passthrough::stat::statx(&parent, Some(&name))?.st;
+    if (entry.st_dev, entry.st_ino) != (st.st_dev, st.st_ino) {
+        return Err(io::Error::from_raw_os_error(libc::ESTALE));
+    }
+
+    // Safe because this doesn't modify any memory and we check the return value.
+    let res = unsafe {
+        libc::linkat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            newdir.as_raw_fd(),
+            newname.as_ptr(),
+            0,
+        )
+    };
+    if res < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Translate the guest's `lseek()` `whence` (Linux's values) to the host's.  Linux and macOS
+/// agree on `SEEK_SET`, `SEEK_CUR` and `SEEK_END`, but swap `SEEK_DATA` (3 on Linux) and
+/// `SEEK_HOLE` (4 on Linux).
+#[cfg(target_os = "macos")]
+pub fn host_seek_whence(whence: u32) -> io::Result<libc::c_int> {
+    match whence {
+        0 => Ok(libc::SEEK_SET),
+        1 => Ok(libc::SEEK_CUR),
+        2 => Ok(libc::SEEK_END),
+        3 => Ok(libc::SEEK_DATA),
+        4 => Ok(libc::SEEK_HOLE),
+        _ => Err(einval()),
+    }
+}
+
+/// Linux's `fallocate()` mode flags, which are what FUSE carries.
+#[cfg(target_os = "macos")]
+const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+
+/// `fallocate()` for macOS, which only has `fcntl(F_PREALLOCATE)` (allocation beyond the end of
+/// the file) and `ftruncate()`.
+///
+/// Mode 0 (allocate and extend) and `FALLOC_FL_KEEP_SIZE` (allocate only) are supported; any
+/// other mode, e.g. hole punching, fails with `EOPNOTSUPP`, after which the guest falls back to
+/// writing.  Preallocation is best-effort on Apple filesystems: if a filesystem does not support
+/// it, the range is not reserved, but `ENOSPC` is reported.
+#[cfg(target_os = "macos")]
+pub fn fallocate(fd: &impl AsRawFd, mode: u32, offset: u64, length: u64) -> io::Result<()> {
+    if mode & !FALLOC_FL_KEEP_SIZE != 0 {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    let end = offset
+        .checked_add(length)
+        .filter(|&end| end <= i64::MAX as u64)
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
+
+    let size = fstat(fd)?.st_size as u64;
+    if end <= size {
+        return Ok(());
+    }
+
+    // `F_PEOFPOSMODE` counts from the end of the file, so `fst_offset` must be 0.
+    let mut store = libc::fstore_t {
+        fst_flags: libc::F_ALLOCATECONTIG,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: (end - size) as libc::off_t,
+        fst_bytesalloc: 0,
+    };
+    // Safe because this only accesses `store`, and we check the return value.
+    let mut res = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+    if res < 0 {
+        store.fst_flags = libc::F_ALLOCATEALL;
+        // Safe because this only accesses `store`, and we check the return value.
+        res = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+    }
+    if res < 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOSPC) {
+            return Err(err);
+        }
+    }
+
+    if mode & FALLOC_FL_KEEP_SIZE == 0 {
+        // Safe because this doesn't modify any memory and we check the return value.
+        if unsafe { libc::ftruncate(fd.as_raw_fd(), end as libc::off_t) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }

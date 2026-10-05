@@ -9,6 +9,9 @@
  * there to a `PassthroughFs`, restoring the state from the migration source.
  */
 
+#[cfg(target_os = "macos")]
+use crate::libc_compat as libc;
+
 use crate::fuse;
 use crate::passthrough::device_state::preserialization::HandleMigrationInfo;
 use crate::passthrough::device_state::serialized;
@@ -16,14 +19,18 @@ use crate::passthrough::file_handle::SerializableFileHandle;
 use crate::passthrough::inode_store::{InodeData, InodeIds, StrongInodeReference};
 use crate::passthrough::mount_fd::MountFd;
 use crate::passthrough::stat::statx;
-use crate::passthrough::util::{openat, printable_fd};
+#[cfg(target_os = "linux")]
+use crate::passthrough::util::openat;
+use crate::passthrough::util::printable_fd;
 use crate::passthrough::{
-    FileOrHandle, FileType, HandleData, HandleDataFile, InodeFileHandlesMode, MigrationOnError,
-    NegotiationMode, PassthroughFs,
+    FileOrHandle, FileType, HandleData, HandleDataFile, InodeFileHandlesMode, InodeRef,
+    MigrationOnError, NegotiationMode, PassthroughFs,
 };
 use crate::util::{other_io_error, ErrorContext, ResultErrorContext};
 use std::collections::{BTreeMap, HashMap};
 use std::convert::{TryFrom, TryInto};
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -351,12 +358,7 @@ impl serialized::Inode {
         filename: &str,
     ) -> io::Result<InodeData> {
         let parent_fd = parent.get().get_file()?;
-        let fd = openat(
-            &parent_fd,
-            filename,
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-        .map_err(|err| {
+        let open_error = |err: io::Error| {
             let pfd = printable_fd(&parent_fd, Some(&fs.proc_self_fd));
             io::Error::new(
                 err.kind(),
@@ -365,16 +367,32 @@ impl serialized::Inode {
                     if pfd.ends_with('/') { "" } else { "/" },
                 ),
             )
-        })?;
-
-        let st = statx(&fd, None)?;
-        let handle = fs.get_file_handle_opt(&fd, &st)?;
-
-        let file_or_handle = if let Some(h) = handle.as_ref() {
-            FileOrHandle::Handle(fs.make_file_handle_openable(h)?)
-        } else {
-            FileOrHandle::File(fs.guest_fds.allocate(fd)?)
         };
+
+        #[cfg(target_os = "linux")]
+        let (fd, st) = {
+            let fd = openat(
+                &parent_fd,
+                filename,
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+            .map_err(open_error)?;
+            let st = statx(&fd, None)?;
+            (InodeRef::File(fd), st)
+        };
+        #[cfg(target_os = "macos")]
+        let (fd, st) = {
+            let filename = CString::new(filename).map_err(other_io_error)?;
+            fs.open_inode_ref(&parent_fd, &filename)
+                .map_err(open_error)?
+        };
+
+        let handle = match &fd {
+            InodeRef::File(file) => fs.get_file_handle_opt(file, &st)?,
+            #[cfg(target_os = "macos")]
+            InodeRef::Name(_) => None,
+        };
+        let file_or_handle = fs.inode_ref_to_file_or_handle(fd, handle.as_ref())?;
 
         Ok(InodeData {
             inode: self.id,
@@ -403,6 +421,10 @@ impl serialized::Inode {
             MigrationOnError::Abort => Err(err.context(format!("Inode {}", self.id))),
             MigrationOnError::GuestError => {
                 warn!("Invalid inode {} indexed: {err}", self.id);
+                let err = io::Error::new(
+                    err.kind(),
+                    format!("Inode is invalid because of an error during the preceding migration, which was: {err}"),
+                );
                 Ok(InodeData {
                     inode: self.id,
                     file_or_handle: FileOrHandle::Invalid(Arc::new(err)),

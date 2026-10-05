@@ -5,6 +5,8 @@
 #[macro_use]
 extern crate log;
 
+mod libc_compat;
+
 pub mod descriptor_utils;
 pub mod file_traits;
 pub mod filesystem;
@@ -16,7 +18,7 @@ pub mod oslib;
 pub mod passthrough;
 pub mod read_dir;
 pub mod sandbox;
-#[cfg(feature = "seccomp")]
+#[cfg(all(feature = "seccomp", target_os = "linux"))]
 pub mod seccomp;
 pub mod server;
 pub mod soft_idmap;

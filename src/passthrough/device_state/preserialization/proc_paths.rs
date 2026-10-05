@@ -12,6 +12,9 @@
  *   double-check step after any path-based preserialization phase
  */
 
+#[cfg(target_os = "macos")]
+use crate::libc_compat as libc;
+
 use super::InodeMigrationInfo;
 use crate::fuse;
 use crate::passthrough::inode_store::{InodeData, InodePathError, StrongInodeReference};

@@ -2,15 +2,22 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#[cfg(target_os = "macos")]
+use crate::libc_compat as libc;
+
 use std::ffi::CStr;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::io::AsRawFd;
 
+#[cfg(target_os = "linux")]
 mod file_status;
+#[cfg(target_os = "linux")]
 use crate::oslib;
+#[cfg(target_os = "linux")]
 use file_status::{statx_st, STATX_BASIC_STATS, STATX_MNT_ID};
 
+#[cfg(target_os = "linux")]
 const EMPTY_CSTR: &[u8] = b"\0";
 
 pub type MountId = u64;
@@ -20,6 +27,7 @@ pub struct StatExt {
     pub mnt_id: MountId,
 }
 
+#[cfg(target_os = "linux")]
 /*
  * Fields in libc::statx are only valid if their respective flag in
  * .stx_mask is set.  This trait provides functions that allow safe
@@ -34,6 +42,7 @@ trait SafeStatXAccess {
     fn mount_id(&self) -> Option<MountId>;
 }
 
+#[cfg(target_os = "linux")]
 impl SafeStatXAccess for statx_st {
     fn stat64(&self) -> Option<libc::stat64> {
         fn makedev(maj: libc::c_uint, min: libc::c_uint) -> libc::dev_t {
@@ -83,6 +92,7 @@ impl SafeStatXAccess for statx_st {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn get_mount_id(dir: &impl AsRawFd, path: &CStr) -> Option<MountId> {
     let mut mount_id: libc::c_int = 0;
     let mut c_fh = oslib::CFileHandle::default();
@@ -92,6 +102,7 @@ fn get_mount_id(dir: &impl AsRawFd, path: &CStr) -> Option<MountId> {
         .and(Some(mount_id as MountId))
 }
 
+#[cfg(target_os = "linux")]
 // Only works on Linux, and libc::SYS_statx is only defined for these
 // environments
 /// Performs a statx() syscall.  libc provides libc::statx() that does
@@ -110,6 +121,7 @@ unsafe fn do_statx(
 }
 
 // Real statx() that depends on do_statx()
+#[cfg(target_os = "linux")]
 pub fn statx(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<StatExt> {
     let mut stx_ui = MaybeUninit::<statx_st>::zeroed();
 
@@ -148,4 +160,35 @@ pub fn statx(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<StatExt> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+/// `fstatat()`/`fstat()` in place of `statx()`.  macOS has no mount IDs, but `st_dev` identifies
+/// the filesystem just as well there: there are no bind mounts that would show one filesystem
+/// at two points.
+#[cfg(target_os = "macos")]
+pub fn statx(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<StatExt> {
+    let mut st = MaybeUninit::<libc::stat>::zeroed();
+
+    // Safe because the kernel will only write data in `st` and we check the return value.
+    let res = unsafe {
+        match path {
+            Some(path) if !path.is_empty() => libc::fstatat(
+                dir.as_raw_fd(),
+                path.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            ),
+            _ => libc::fstat(dir.as_raw_fd(), st.as_mut_ptr()),
+        }
+    };
+    if res < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Safe because the kernel has initialized `st`.
+    let st = libc::stat64::from(unsafe { &st.assume_init() });
+    Ok(StatExt {
+        mnt_id: st.st_dev,
+        st,
+    })
 }

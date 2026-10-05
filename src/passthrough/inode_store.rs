@@ -1,10 +1,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
+#[cfg(target_os = "macos")]
+use crate::libc_compat as libc;
+
 use crate::fuse;
 use crate::passthrough::device_state::preserialization::InodeMigrationInfo;
 use crate::passthrough::file_handle::{FileHandle, FileOrHandle};
-use crate::passthrough::stat::MountId;
+use crate::passthrough::stat::{statx, MountId, StatExt};
+#[cfg(target_os = "macos")]
+use crate::passthrough::util::open_same_inode;
 use crate::passthrough::util::{
     ebadf, get_path_by_fd, is_safe_inode, reopen_fd_through_proc, FdPathError,
 };
@@ -128,6 +133,16 @@ pub(crate) enum InodePathError {
     OutsideRoot,
 }
 
+/// The error to return for an operation on an inode that has no file (`FileOrHandle::Invalid`):
+/// the OS error that made it invalid, so the guest gets the same error, or, if it is not an OS
+/// error, an equivalent error (which the guest receives as `EIO`).
+fn invalid_inode_error(err: &io::Error) -> io::Error {
+    match err.raw_os_error() {
+        Some(errno) => io::Error::from_raw_os_error(errno),
+        None => io::Error::new(err.kind(), err.to_string()),
+    }
+}
+
 impl<'a> InodeData {
     /// Get an `O_PATH` file for this inode
     pub fn get_file(&'a self) -> io::Result<InodeFile<'a>> {
@@ -137,11 +152,27 @@ impl<'a> InodeData {
                 let file = h.open(libc::O_PATH)?;
                 Ok(InodeFile::Owned(file))
             }
-            FileOrHandle::Invalid(err) => Err(io::Error::new(
-                err.kind(),
-                format!("Inode is invalid because of an error during the preceding migration, which was: {err}"),
-            )),
+            #[cfg(target_os = "macos")]
+            FileOrHandle::Name(n) => {
+                if !is_safe_inode(self.mode) {
+                    return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+                }
+                let file = n.with(&self.ids, |dir, name, st| {
+                    open_same_inode(dir, name, libc::O_PATH | libc::O_CLOEXEC, &st.st)
+                })?;
+                Ok(InodeFile::Owned(file))
+            }
+            FileOrHandle::Invalid(err) => Err(invalid_inode_error(err)),
         }
+    }
+
+    /// Get this inode's stat information
+    pub fn stat(&self) -> io::Result<StatExt> {
+        #[cfg(target_os = "macos")]
+        if let FileOrHandle::Name(n) = &self.file_or_handle {
+            return n.with(&self.ids, |_, _, st| Ok(st));
+        }
+        statx(&self.get_file()?, None)
     }
 
     /// Try to obtain this inode's path through /proc/self/fd
@@ -182,10 +213,17 @@ impl<'a> InodeData {
                 let new_file = h.open(flags)?;
                 Ok(InodeFile::Owned(new_file))
             }
-            FileOrHandle::Invalid(err) => Err(io::Error::new(
-                err.kind(),
-                format!("Inode is invalid because of an error during the preceding migration, which was: {err}"),
-            )),
+            #[cfg(target_os = "macos")]
+            FileOrHandle::Name(n) => {
+                if !is_safe_inode(self.mode) {
+                    return Err(ebadf());
+                }
+                let new_file = n.with(&self.ids, |dir, name, st| {
+                    open_same_inode(dir, name, flags, &st.st)
+                })?;
+                Ok(InodeFile::Owned(new_file))
+            }
+            FileOrHandle::Invalid(err) => Err(invalid_inode_error(err)),
         }
     }
 
@@ -413,7 +451,14 @@ impl InodeStore {
                     // new inode.  Such inodes must be looked up by file handle, because this
                     // handle contains a generation ID to differentiate between the old and the new
                     // inode.
-                    matches!(data.file_or_handle, FileOrHandle::File(_))
+                    // (Inodes referenced by name on macOS have no FD open either, but the inode
+                    // IDs on Apple's file systems are not reused.)
+                    match data.file_or_handle {
+                        FileOrHandle::File(_) => true,
+                        #[cfg(target_os = "macos")]
+                        FileOrHandle::Name(_) => true,
+                        _ => false,
+                    }
                 })
             })
             .ok_or_else(|| {
@@ -436,6 +481,8 @@ impl InodeStore {
         let handle = match &inode_data.file_or_handle {
             FileOrHandle::File(_) => None,
             FileOrHandle::Handle(handle) => Some(handle.inner()),
+            #[cfg(target_os = "macos")]
+            FileOrHandle::Name(_) => None,
             FileOrHandle::Invalid(_) => None,
         };
         if let Ok(inode) = self.do_claim_inode(&inner, handle, &inode_data.ids) {

@@ -2,14 +2,19 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::{idmap, oslib, passthrough, util};
-use idmap::{GidMap, IdMapSetUpPipeMessage, UidMap};
+use crate::idmap::{GidMap, UidMap};
+#[cfg(target_os = "linux")]
+use crate::{idmap::IdMapSetUpPipeMessage, oslib, passthrough, util};
 use std::ffi::CString;
 use std::fs::{self, File};
+#[cfg(target_os = "linux")]
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
 use std::os::fd::OwnedFd;
+#[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::process::{self, Command};
 use std::str::FromStr;
 use std::{error, fmt, io};
@@ -85,6 +90,9 @@ pub enum Error {
     SandboxModeInvalidUidMap,
     /// Setting gid_map is only allowed inside a namespace for non-privileged users
     SandboxModeInvalidGidMap,
+    /// Namespaces are specific to Linux.
+    #[cfg(not(target_os = "linux"))]
+    SandboxModeNamespaceUnsupported,
 }
 
 impl error::Error for Error {}
@@ -96,11 +104,28 @@ impl fmt::Display for Error {
             WriteUidMap,
         };
         match self {
+            #[cfg(target_os = "linux")]
             SandboxModeInvalidUID => {
                 write!(
                     f,
                     "sandbox mode 'chroot' can only be used by \
                     root (Use '--sandbox namespace' instead)"
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            SandboxModeInvalidUID => {
+                write!(
+                    f,
+                    "sandbox mode 'chroot' can only be used by \
+                    root (Use '--sandbox none' instead)"
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            Error::SandboxModeNamespaceUnsupported => {
+                write!(
+                    f,
+                    "sandbox mode 'namespace' is only available on Linux \
+                    (Use '--sandbox chroot' or '--sandbox none' instead)"
                 )
             }
             SandboxModeInvalidUidMap => {
@@ -190,6 +215,7 @@ impl Sandbox {
     // descriptor obtained for `/proc/self/fd`.
     //
     // It's ugly, but it's the only way until Linux implements a proper containerization API.
+    #[cfg(target_os = "linux")]
     fn setup_mounts(&mut self) -> Result<(), Error> {
         // Open an FD to `/proc/self` so we can later open `/proc/self/mountinfo`.
         // (If we opened `/proc/self/mountinfo` now, it would appear empty by the end of this
@@ -318,6 +344,7 @@ impl Sandbox {
     }
 
     /// Sets mappings for the given uid and gid.
+    #[cfg(target_os = "linux")]
     fn setup_id_mappings(
         &self,
         uid_map: &[UidMap],
@@ -415,6 +442,7 @@ impl Sandbox {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     pub fn enter_namespace(&mut self, listener: Listener) -> Result<Listener, Error> {
         let uid = unsafe { libc::geteuid() };
 
@@ -534,21 +562,25 @@ impl Sandbox {
     }
 
     pub fn enter_chroot(&mut self) -> Result<(), Error> {
-        let c_proc_self_fd = CString::new("/proc/self/fd").unwrap();
-        let proc_self_fd = unsafe { libc::open(c_proc_self_fd.as_ptr(), libc::O_PATH) };
-        if proc_self_fd < 0 {
-            return Err(Error::OpenProcSelfFd(std::io::Error::last_os_error()));
-        }
-        // Safe because we just opened this fd.
-        self.proc_self_fd = Some(unsafe { File::from_raw_fd(proc_self_fd) });
+        // macOS has no procfs.
+        #[cfg(target_os = "linux")]
+        {
+            let c_proc_self_fd = CString::new("/proc/self/fd").unwrap();
+            let proc_self_fd = unsafe { libc::open(c_proc_self_fd.as_ptr(), libc::O_PATH) };
+            if proc_self_fd < 0 {
+                return Err(Error::OpenProcSelfFd(std::io::Error::last_os_error()));
+            }
+            // Safe because we just opened this fd.
+            self.proc_self_fd = Some(unsafe { File::from_raw_fd(proc_self_fd) });
 
-        let c_mountinfo = CString::new("/proc/self/mountinfo").unwrap();
-        let mountinfo_fd = unsafe { libc::open(c_mountinfo.as_ptr(), libc::O_RDONLY) };
-        if mountinfo_fd < 0 {
-            return Err(Error::OpenMountinfo(std::io::Error::last_os_error()));
+            let c_mountinfo = CString::new("/proc/self/mountinfo").unwrap();
+            let mountinfo_fd = unsafe { libc::open(c_mountinfo.as_ptr(), libc::O_RDONLY) };
+            if mountinfo_fd < 0 {
+                return Err(Error::OpenMountinfo(std::io::Error::last_os_error()));
+            }
+            // Safe because we just opened this fd.
+            self.mountinfo_fd = Some(unsafe { File::from_raw_fd(mountinfo_fd) });
         }
-        // Safe because we just opened this fd.
-        self.mountinfo_fd = Some(unsafe { File::from_raw_fd(mountinfo_fd) });
 
         let c_shared_dir = CString::new(self.shared_dir.clone()).unwrap();
         let ret = unsafe { libc::chroot(c_shared_dir.as_ptr()) };
@@ -651,7 +683,10 @@ impl Sandbox {
         }
 
         match self.sandbox_mode {
+            #[cfg(target_os = "linux")]
             SandboxMode::Namespace => self.enter_namespace(listener),
+            #[cfg(not(target_os = "linux"))]
+            SandboxMode::Namespace => Err(Error::SandboxModeNamespaceUnsupported),
             SandboxMode::Chroot => self.enter_chroot().and(Ok(listener)),
             SandboxMode::None => Ok(listener),
         }

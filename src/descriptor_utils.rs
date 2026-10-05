@@ -14,8 +14,8 @@ use vhost_user_backend::bitmap::BitmapMmapRegion;
 use virtio_queue::DescriptorChain;
 use vm_memory::bitmap::{Bitmap, BitmapSlice};
 use vm_memory::{
-    Address, ByteValued, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
-    VolatileMemory, VolatileMemoryError, VolatileSlice,
+    Address, ByteValued, GuestMemory, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap,
+    GuestMemoryRegion, VolatileMemory, VolatileMemoryError, VolatileSlice,
 };
 
 use crate::file_traits::FileReadWriteAtVolatile;
@@ -557,7 +557,7 @@ mod tests {
         assert_eq!(reader.available_bytes(), 106);
         assert_eq!(reader.bytes_read(), 0);
 
-        let mut buffer = [0 as u8; 64];
+        let mut buffer = [0u8; 64];
         if let Err(e) = reader.read_exact(&mut buffer) {
             panic!("read_exact should not fail here: {:?}", e);
         }
@@ -598,7 +598,7 @@ mod tests {
         assert_eq!(writer.available_bytes(), 106);
         assert_eq!(writer.bytes_written(), 0);
 
-        let buffer = [0 as u8; 64];
+        let buffer = [0u8; 64];
         if let Err(e) = writer.write_all(&buffer) {
             panic!("write_all should not fail here: {:?}", e);
         }
@@ -943,7 +943,7 @@ mod tests {
         .expect("create_descriptor_chain failed");
         let mut reader = Reader::new(&memory, chain).expect("failed to create Reader");
 
-        let mut buf = vec![0u8; 64];
+        let mut buf = [0u8; 64];
         assert_eq!(
             reader.read(&mut buf[..]).expect("failed to read to buffer"),
             48
@@ -967,7 +967,7 @@ mod tests {
         .expect("create_descriptor_chain failed");
         let mut writer = Writer::new(&memory, chain).expect("failed to create Writer");
 
-        let buf = vec![0xdeu8; 64];
+        let buf = [0xdeu8; 64];
         assert_eq!(
             writer.write(&buf[..]).expect("failed to write from buffer"),
             48

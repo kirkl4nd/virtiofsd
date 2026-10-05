@@ -2,21 +2,23 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#[cfg(target_os = "macos")]
+use crate::libc_compat as libc;
+
 use super::{InodeLocation, InodeMigrationInfo};
 use crate::filesystem::DirectoryIterator;
 use crate::fuse;
 use crate::passthrough::file_handle::{FileHandle, SerializableFileHandle};
 use crate::passthrough::inode_store::{InodeData, InodeIds, StrongInodeReference};
 use crate::passthrough::stat::statx;
-use crate::passthrough::{FileOrHandle, PassthroughFs};
+use crate::passthrough::{InodeRef, PassthroughFs};
 use crate::read_dir::ReadDir;
 use crate::util::{other_io_error, ResultErrorContext};
 use std::convert::{TryFrom, TryInto};
 use std::ffi::{CStr, CString};
 use std::fmt::{self, Display};
-use std::fs::File;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -232,14 +234,12 @@ impl<'a> Constructor<'a> {
             return Ok(None);
         }
 
-        let path_fd = {
-            let fd = self
-                .fs
-                .open_relative_to(parent_fd, name, libc::O_PATH, None)?;
-            unsafe { File::from_raw_fd(fd) }
+        let (path_fd, stat) = self.fs.open_inode_ref(parent_fd, name)?;
+        let handle = match &path_fd {
+            InodeRef::File(file) => self.fs.get_file_handle_opt(file, &stat)?,
+            #[cfg(target_os = "macos")]
+            InodeRef::Name(_) => None,
         };
-        let stat = statx(&path_fd, None)?;
-        let handle = self.fs.get_file_handle_opt(&path_fd, &stat)?;
 
         let ids = InodeIds {
             ino: stat.st.st_ino,
@@ -257,9 +257,13 @@ impl<'a> Constructor<'a> {
                     filename: utf8_name.to_string(),
                 },
                 || {
-                    Ok(match &handle {
-                        Some(h) => h.into(),
-                        None => FileHandle::from_fd_fail_hard(&path_fd)?.into(),
+                    Ok(match (&handle, &path_fd) {
+                        (Some(h), _) => h.into(),
+                        (None, InodeRef::File(file)) => FileHandle::from_fd_fail_hard(file)?.into(),
+                        #[cfg(target_os = "macos")]
+                        (None, InodeRef::Name(_)) => {
+                            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+                        }
                     })
                 },
             )?;
@@ -283,11 +287,9 @@ impl<'a> Constructor<'a> {
         // `Self::execute()` returns, dropping it from the inode store again, so it will not
         // actually end up being serialized.)
 
-        let file_or_handle = if let Some(h) = handle.as_ref() {
-            FileOrHandle::Handle(self.fs.make_file_handle_openable(h)?)
-        } else {
-            FileOrHandle::File(self.fs.guest_fds.allocate(path_fd)?)
-        };
+        let file_or_handle = self
+            .fs
+            .inode_ref_to_file_or_handle(path_fd, handle.as_ref())?;
 
         let mig_info = InodeMigrationInfo::new_internal(
             &self.fs.cfg,

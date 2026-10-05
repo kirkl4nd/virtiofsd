@@ -1,18 +1,27 @@
 // Copyright 2020 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
+#[cfg(target_os = "macos")]
+use crate::libc_compat as libc;
+
 use crate::filesystem::{DirEntry, DirectoryIterator};
 
+#[cfg(target_os = "macos")]
+use std::convert::TryInto;
 use std::ffi::CStr;
 use std::io;
+#[cfg(target_os = "linux")]
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::os::unix::io::AsRawFd;
 
+#[cfg(target_os = "linux")]
 use log::debug;
 
+#[cfg(target_os = "linux")]
 use vm_memory::ByteValued;
 
+#[cfg(target_os = "linux")]
 #[repr(C, packed)]
 #[derive(Default, Clone, Copy)]
 struct LinuxDirent64 {
@@ -21,8 +30,10 @@ struct LinuxDirent64 {
     d_reclen: libc::c_ushort,
     d_ty: libc::c_uchar,
 }
+#[cfg(target_os = "linux")]
 unsafe impl ByteValued for LinuxDirent64 {}
 
+#[cfg(target_os = "linux")]
 #[derive(Default)]
 pub struct ReadDir<P> {
     buf: P,
@@ -30,6 +41,7 @@ pub struct ReadDir<P> {
     end: usize,
 }
 
+#[cfg(target_os = "linux")]
 impl<P: DerefMut<Target = [u8]>> ReadDir<P> {
     /// Seek to `offset` in the directory and read a batch of entries.
     ///
@@ -127,6 +139,181 @@ impl<P: DerefMut<Target = [u8]>> ReadDir<P> {
     }
 }
 
+/// Offset of `d_name` in Darwin's `struct dirent`. The compiler would pad a
+/// `#[repr(C)]` struct to 24 bytes; the kernel layout has the name at 21.
+#[cfg(target_os = "macos")]
+const DIRENT_NAME_OFF: usize = 21;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn __getdirentries64(
+        fd: libc::c_int,
+        buf: *mut libc::c_void,
+        bufsize: libc::size_t,
+        basep: *mut libc::off_t,
+    ) -> libc::ssize_t;
+}
+
+/// macOS's `d_seekoff` is 0 on APFS, so the guest's FUSE cookie is a 1-based
+/// count of entries already returned. Each call rewinds and skips that many.
+#[cfg(target_os = "macos")]
+pub struct ReadDir<P> {
+    buf: P,
+    current: usize,
+    end: usize,
+    next_index: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl<P> Default for ReadDir<P>
+where
+    P: Default,
+{
+    fn default() -> Self {
+        ReadDir {
+            buf: P::default(),
+            current: 0,
+            end: 0,
+            next_index: 0,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl<P: DerefMut<Target = [u8]>> ReadDir<P> {
+    pub fn new<D: AsRawFd>(dir: &D, offset: u64, buf: P) -> io::Result<Self> {
+        let res = unsafe { libc::lseek(dir.as_raw_fd(), 0, libc::SEEK_SET) };
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut rd = unsafe { Self::new_no_seek(dir, buf)? };
+        if offset == 0 {
+            return Ok(rd);
+        }
+        let mut skipped = 0u64;
+        loop {
+            while DirectoryIterator::next(&mut rd).is_some() {
+                skipped += 1;
+                if skipped == offset {
+                    if rd.remaining() > 0 {
+                        rd.next_index = offset;
+                        return Ok(rd);
+                    }
+                    // Last in this batch; the fd is already at the next one.
+                    let mut next = unsafe { Self::new_no_seek(dir, rd.buf)? };
+                    next.next_index = offset;
+                    return Ok(next);
+                }
+            }
+            let buf = rd.buf;
+            rd = unsafe { Self::new_no_seek(dir, buf)? };
+            if rd.remaining() == 0 {
+                rd.next_index = offset;
+                return Ok(rd);
+            }
+        }
+    }
+
+    /// # Safety
+    /// Caller must ensure the current position is valid, for example, by exclusively using this
+    /// function on a given FD, potentially repeatedly.
+    pub unsafe fn new_no_seek<D: AsRawFd>(dir: &D, mut buf: P) -> io::Result<Self> {
+        let mut basep: libc::off_t = 0;
+        let res = unsafe {
+            __getdirentries64(
+                dir.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                &mut basep,
+            )
+        };
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ReadDir {
+            buf,
+            current: 0,
+            end: res as usize,
+            next_index: 0,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl<P: Deref<Target = [u8]>> DirectoryIterator for ReadDir<P> {
+    fn next(&mut self) -> Option<DirEntry<'_>> {
+        let rem = &self.buf[self.current..self.end];
+        if rem.len() < DIRENT_NAME_OFF {
+            return None;
+        }
+        let d_ino = u64::from_ne_bytes(rem[0..8].try_into().unwrap());
+        let d_reclen = u16::from_ne_bytes(rem[16..18].try_into().unwrap()) as usize;
+        let d_namlen = u16::from_ne_bytes(rem[18..20].try_into().unwrap()) as usize;
+        let d_type = rem[20];
+        if d_reclen == 0 || d_reclen > rem.len() {
+            return None;
+        }
+        let name_end = DIRENT_NAME_OFF + d_namlen;
+        if name_end > rem.len() {
+            return None;
+        }
+        let name = if name_end < rem.len() && rem[name_end] == 0 {
+            unsafe { CStr::from_bytes_with_nul_unchecked(&rem[DIRENT_NAME_OFF..=name_end]) }
+        } else {
+            strip_padding(&rem[DIRENT_NAME_OFF..name_end])
+        };
+        self.current += d_reclen;
+        self.next_index += 1;
+        Some(DirEntry {
+            ino: d_ino,
+            offset: self.next_index,
+            type_: u32::from(d_type),
+            name,
+        })
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_test {
+    use super::*;
+    use std::fs;
+    use vmm_sys_util::tempdir::TempDir;
+
+    fn collect(directory: &fs::File) -> Vec<(u64, String)> {
+        let mut entries = Vec::new();
+        let mut offset = 0u64;
+        loop {
+            let mut rd = ReadDir::new(directory, offset, vec![0u8; 4096]).unwrap();
+            if rd.remaining() == 0 {
+                break;
+            }
+            while let Some(e) = DirectoryIterator::next(&mut rd) {
+                offset = e.offset;
+                entries.push((e.offset, e.name.to_string_lossy().into_owned()));
+            }
+        }
+        entries
+    }
+
+    #[test]
+    fn readdir_resumes_from_cookie() {
+        let td = TempDir::new_with_prefix("/tmp/virtiofsd_test_").unwrap();
+        for i in 0..200 {
+            fs::write(td.as_path().join(format!("file_{i:03}")), b"").unwrap();
+        }
+        let file = fs::File::open(td.as_path()).unwrap();
+        let all = collect(&file);
+        assert!(all.len() >= 202, "got {}", all.len());
+        for mid in [0, all.len() / 2, all.len() - 2] {
+            let cookie = all[mid].0;
+            let mut rd = ReadDir::new(&file, cookie, vec![0u8; 256]).unwrap();
+            let first = DirectoryIterator::next(&mut rd).expect("entry after cookie");
+            assert_eq!(first.name.to_string_lossy(), all[mid + 1].1);
+            assert_eq!(first.offset, all[mid + 1].0);
+        }
+    }
+}
+
 impl<P> ReadDir<P> {
     /// Returns the number of bytes from the internal buffer that have not yet been consumed.
     pub fn remaining(&self) -> usize {
@@ -134,6 +321,7 @@ impl<P> ReadDir<P> {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl<P: Deref<Target = [u8]>> DirectoryIterator for ReadDir<P> {
     fn next(&mut self) -> Option<DirEntry<'_>> {
         let rem = &self.buf[self.current..self.end];
@@ -190,7 +378,7 @@ fn strip_padding(b: &[u8]) -> &CStr {
     unsafe { CStr::from_bytes_with_nul_unchecked(&b[..=pos]) }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod test {
     use super::*;
     use std::ffi::CString;
@@ -316,10 +504,9 @@ mod test {
         let (_td, file) = make_test_dir(10);
         let all = collect_entries(&file);
 
-        for i in 0..all.len() - 1 {
-            let cookie = all[i].1;
-            let mut rd_seek = ReadDir::new(&file, cookie, vec![0u8; 4096]).unwrap();
-            let mut rd_walk = ReadDir::new_walk_to(&file, cookie, vec![0u8; 4096]).unwrap();
+        for (_, cookie, _) in all.iter().take(all.len().saturating_sub(1)) {
+            let mut rd_seek = ReadDir::new(&file, *cookie, vec![0u8; 4096]).unwrap();
+            let mut rd_walk = ReadDir::new_walk_to(&file, *cookie, vec![0u8; 4096]).unwrap();
 
             loop {
                 match (next_entry(&mut rd_seek), next_entry(&mut rd_walk)) {
@@ -336,11 +523,11 @@ mod test {
         let (_td, file) = make_test_dir(20);
         let all = collect_entries(&file);
 
-        for i in 0..all.len() - 1 {
-            let cookie = all[i].1;
+        for window in all.windows(2) {
+            let cookie = window[0].1;
             let mut rd = ReadDir::new_walk_to(&file, cookie, vec![0u8; 128]).unwrap();
             let e = next_entry(&mut rd).expect("expected entry after cookie");
-            assert_eq!(e.0, all[i + 1].0, "ino mismatch at cookie {}", cookie);
+            assert_eq!(e.0, window[1].0, "ino mismatch at cookie {}", cookie);
         }
     }
 

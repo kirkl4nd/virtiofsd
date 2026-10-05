@@ -2,10 +2,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#[cfg(target_os = "macos")]
+use crate::libc_compat as libc;
+
 use std::fs::{File, OpenOptions};
 use std::io::{Error, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::{fs, io, process};
 
@@ -49,12 +54,14 @@ pub fn write_pid_file(pid_file_name: &Path) -> Result<File, std::io::Error> {
     Ok(pid_file)
 }
 
+#[cfg(target_os = "linux")]
 unsafe fn pidfd_open(pid: libc::pid_t, flags: libc::c_uint) -> libc::c_int {
     libc::syscall(libc::SYS_pidfd_open, pid, flags) as libc::c_int
 }
 
 /// Helper function to create a process and sets the parent process
 /// death signal SIGTERM
+#[cfg(target_os = "linux")]
 pub fn sfork() -> io::Result<i32> {
     let cur_pid = unsafe { libc::getpid() };
 
@@ -104,6 +111,7 @@ pub fn sfork() -> io::Result<i32> {
     Ok(child_pid)
 }
 
+#[cfg(target_os = "linux")]
 pub fn wait_for_child(pid: i32) -> ! {
     // Drop all capabilities, since the parent doesn't require any
     // capabilities, as it'd be just waiting for the child to exit.
@@ -143,6 +151,7 @@ pub fn wait_for_child(pid: i32) -> ! {
 /// - if `capng::update()` fails to update the internal posix capabilities settings.
 /// - if `capng::apply()` fails to transfer the specified internal posix capabilities settings to
 ///   the kernel.
+#[cfg(target_os = "linux")]
 pub fn add_cap_to_eff(cap_name: &str) -> capng::Result<()> {
     use capng::{Action, CUpdate, Set, Type};
     let cap = capng::name_to_capability(cap_name)?;

@@ -4,6 +4,8 @@
 
 use crate::oslib;
 use crate::passthrough::guest_fd_limit::GuestFile;
+#[cfg(target_os = "macos")]
+use crate::passthrough::inode_name::InodeName;
 use crate::passthrough::mount_fd::{MPRResult, MountFd, MountFds};
 use crate::passthrough::stat::MountId;
 use serde::{Deserialize, Serialize};
@@ -16,6 +18,12 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 const EMPTY_CSTR: &[u8] = b"\0";
+
+#[cfg(target_os = "linux")]
+use libc::AT_EMPTY_PATH;
+// Only passed to `name_to_handle_at()`, which macOS does not have.
+#[cfg(target_os = "macos")]
+const AT_EMPTY_PATH: libc::c_int = 0;
 
 #[derive(Clone, PartialOrd, Ord, PartialEq, Eq)]
 pub struct FileHandle {
@@ -38,6 +46,8 @@ pub struct SerializableFileHandle {
 pub enum FileOrHandle {
     File(GuestFile),
     Handle(OpenableFileHandle),
+    #[cfg(target_os = "macos")]
+    Name(InodeName),
     // `io::Error` does not implement `Clone`, so without wrapping it in `Arc`, returning the error
     // anywhere would be impossible without consuming it
     Invalid(Arc<io::Error>),
@@ -50,7 +60,7 @@ impl FileHandle {
         let mut mount_id: libc::c_int = 0;
         let mut c_fh = oslib::CFileHandle::default();
 
-        oslib::name_to_handle_at(dir, path, &mut c_fh, &mut mount_id, libc::AT_EMPTY_PATH)?;
+        oslib::name_to_handle_at(dir, path, &mut c_fh, &mut mount_id, AT_EMPTY_PATH)?;
         Ok(FileHandle {
             mnt_id: mount_id as MountId,
             handle: c_fh,
@@ -236,6 +246,8 @@ impl TryFrom<&FileOrHandle> for SerializableFileHandle {
             FileOrHandle::File(file) => {
                 FileHandle::from_fd_fail_hard(file).map(SerializableFileHandle::from)
             }
+            #[cfg(target_os = "macos")]
+            FileOrHandle::Name(_) => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
             FileOrHandle::Invalid(err) => Err(io::Error::new(err.kind(), Arc::clone(err))),
         }
     }

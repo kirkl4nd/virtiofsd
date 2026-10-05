@@ -35,6 +35,12 @@ After installing Rust, you can compile it to a binary by running:
 cargo build --release
 ```
 
+On macOS, libcap-ng and libseccomp are not used. File handles, POSIX ACLs,
+seccomp, and namespace sandboxing are unavailable; the defaults switch to
+`--inode-file-handles=never` and `--sandbox=chroot`. Unprivileged use still
+needs `--sandbox none` (and typically `--translate-uid`). macOS 13 or later
+is required.
+
 ## CI-built binaries
 
 Every time new code is merged, the CI pipeline will upload a debug binary
@@ -90,6 +96,13 @@ Print vhost-user.json backend program capabilities and exit.
 --allow-direct-io
 ```
 Honor the `O_DIRECT` flag passed down by guest applications.
+
+```shell
+--guest-arch <x86_64|aarch64>
+```
+Architecture of the guest kernel. Four open flags have different values on
+x86_64 and aarch64, and the guest sends its own. The default is the host
+architecture, which is correct for hardware virtualization.
 
 ```shell
 --announce-submounts
@@ -267,14 +280,14 @@ Both **namespace** and **chroot** sandbox modes prevent "file system escapes"
 due to symlinks and other file system objects that might lead to files outside
 the shared directory.
 
-Default: namespace.
+Default: namespace on Linux, chroot on macOS. `namespace` is Linux-only.
 
 ```shell
 --seccomp <seccomp>
 ```
 Action to take when seccomp finds a not allowed syscall (none, kill, log, trap).
 
-Default: kill.
+Default: kill. Linux-only; the option is not available on macOS.
 
 ```shell
 --cache <cache>

@@ -1,6 +1,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
+#[cfg(target_os = "macos")]
+use crate::libc_compat as libc;
+
 use crate::passthrough::stat::{statx, MountId};
 use crate::passthrough::util::openat;
 use crate::util::ResultErrorContext;

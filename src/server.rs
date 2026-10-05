@@ -23,6 +23,138 @@ use vm_memory::ByteValued;
 
 const FUSE_BUFFER_HEADER_SIZE: u32 = 0x1000;
 const MAX_BUFFER_SIZE: u32 = 1 << 20;
+
+/// Translate a native errno value to a Linux errno value.
+///
+/// The FUSE protocol uses Linux errno values. On Linux this is a no-op, but on macOS
+/// many errno values differ and must be translated before being sent to the guest kernel.
+#[cfg(target_os = "linux")]
+#[inline]
+fn errno_to_linux(errno: i32) -> i32 {
+    errno
+}
+
+/// Linux `<asm-generic/errno.h>` values. `libc` on macOS has Darwin numbers.
+#[cfg(target_os = "macos")]
+mod linux_errno {
+    pub const EAGAIN: i32 = 11;
+    pub const EDEADLK: i32 = 35;
+    pub const ENAMETOOLONG: i32 = 36;
+    pub const ENOLCK: i32 = 37;
+    pub const ENOSYS: i32 = 38;
+    pub const ENOTEMPTY: i32 = 39;
+    pub const ELOOP: i32 = 40;
+    pub const ENOMSG: i32 = 42;
+    pub const EIDRM: i32 = 43;
+    pub const ENOSTR: i32 = 60;
+    pub const ENODATA: i32 = 61;
+    pub const ETIME: i32 = 62;
+    pub const ENOSR: i32 = 63;
+    pub const ENOLINK: i32 = 67;
+    pub const EPROTO: i32 = 71;
+    pub const EMULTIHOP: i32 = 72;
+    pub const EBADMSG: i32 = 74;
+    pub const EOVERFLOW: i32 = 75;
+    pub const EILSEQ: i32 = 84;
+    pub const ENOTSOCK: i32 = 88;
+    pub const EDESTADDRREQ: i32 = 89;
+    pub const EMSGSIZE: i32 = 90;
+    pub const EPROTOTYPE: i32 = 91;
+    pub const ENOPROTOOPT: i32 = 92;
+    pub const EPROTONOSUPPORT: i32 = 93;
+    pub const ESOCKTNOSUPPORT: i32 = 94;
+    pub const EOPNOTSUPP: i32 = 95;
+    pub const EPFNOSUPPORT: i32 = 96;
+    pub const EAFNOSUPPORT: i32 = 97;
+    pub const EADDRINUSE: i32 = 98;
+    pub const EADDRNOTAVAIL: i32 = 99;
+    pub const ENETDOWN: i32 = 100;
+    pub const ENETUNREACH: i32 = 101;
+    pub const ENETRESET: i32 = 102;
+    pub const ECONNABORTED: i32 = 103;
+    pub const ECONNRESET: i32 = 104;
+    pub const ENOBUFS: i32 = 105;
+    pub const EISCONN: i32 = 106;
+    pub const ENOTCONN: i32 = 107;
+    pub const ESHUTDOWN: i32 = 108;
+    pub const ETOOMANYREFS: i32 = 109;
+    pub const ETIMEDOUT: i32 = 110;
+    pub const ECONNREFUSED: i32 = 111;
+    pub const EHOSTDOWN: i32 = 112;
+    pub const EHOSTUNREACH: i32 = 113;
+    pub const EALREADY: i32 = 114;
+    pub const EINPROGRESS: i32 = 115;
+    pub const ESTALE: i32 = 116;
+    pub const EDQUOT: i32 = 122;
+    pub const ECANCELED: i32 = 125;
+    pub const EOWNERDEAD: i32 = 130;
+    pub const ENOTRECOVERABLE: i32 = 131;
+}
+
+#[cfg(target_os = "macos")]
+fn errno_to_linux(errno: i32) -> i32 {
+    // 1..=34 (EPERM..ERANGE) match Linux. Darwin then diverges; `libc::EOPNOTSUPP`
+    // is the BSD 102, which Linux reads as ENETRESET, and `ENOATTR` is 93, which
+    // Linux reads as EPROTONOSUPPORT. Anything else becomes EIO so a macOS-only
+    // code cannot collide with a different Linux errno.
+    match errno {
+        libc::EAGAIN => linux_errno::EAGAIN,
+        libc::EDEADLK => linux_errno::EDEADLK,
+        libc::EINPROGRESS => linux_errno::EINPROGRESS,
+        libc::EALREADY => linux_errno::EALREADY,
+        libc::ENOTSOCK => linux_errno::ENOTSOCK,
+        libc::EDESTADDRREQ => linux_errno::EDESTADDRREQ,
+        libc::EMSGSIZE => linux_errno::EMSGSIZE,
+        libc::EPROTOTYPE => linux_errno::EPROTOTYPE,
+        libc::ENOPROTOOPT => linux_errno::ENOPROTOOPT,
+        libc::EPROTONOSUPPORT => linux_errno::EPROTONOSUPPORT,
+        libc::ESOCKTNOSUPPORT => linux_errno::ESOCKTNOSUPPORT,
+        libc::ENOTSUP | libc::EOPNOTSUPP => linux_errno::EOPNOTSUPP,
+        libc::EPFNOSUPPORT => linux_errno::EPFNOSUPPORT,
+        libc::EAFNOSUPPORT => linux_errno::EAFNOSUPPORT,
+        libc::EADDRINUSE => linux_errno::EADDRINUSE,
+        libc::EADDRNOTAVAIL => linux_errno::EADDRNOTAVAIL,
+        libc::ENETDOWN => linux_errno::ENETDOWN,
+        libc::ENETUNREACH => linux_errno::ENETUNREACH,
+        libc::ENETRESET => linux_errno::ENETRESET,
+        libc::ECONNABORTED => linux_errno::ECONNABORTED,
+        libc::ECONNRESET => linux_errno::ECONNRESET,
+        libc::ENOBUFS => linux_errno::ENOBUFS,
+        libc::EISCONN => linux_errno::EISCONN,
+        libc::ENOTCONN => linux_errno::ENOTCONN,
+        libc::ESHUTDOWN => linux_errno::ESHUTDOWN,
+        libc::ETOOMANYREFS => linux_errno::ETOOMANYREFS,
+        libc::ETIMEDOUT => linux_errno::ETIMEDOUT,
+        libc::ECONNREFUSED => linux_errno::ECONNREFUSED,
+        libc::ELOOP => linux_errno::ELOOP,
+        libc::ENAMETOOLONG => linux_errno::ENAMETOOLONG,
+        libc::EHOSTDOWN => linux_errno::EHOSTDOWN,
+        libc::EHOSTUNREACH => linux_errno::EHOSTUNREACH,
+        libc::ENOTEMPTY => linux_errno::ENOTEMPTY,
+        libc::EDQUOT => linux_errno::EDQUOT,
+        libc::ESTALE => linux_errno::ESTALE,
+        libc::ENOLCK => linux_errno::ENOLCK,
+        libc::ENOSYS => linux_errno::ENOSYS,
+        libc::EOVERFLOW => linux_errno::EOVERFLOW,
+        libc::ECANCELED => linux_errno::ECANCELED,
+        libc::EIDRM => linux_errno::EIDRM,
+        libc::ENOMSG => linux_errno::ENOMSG,
+        libc::EILSEQ => linux_errno::EILSEQ,
+        libc::ENOATTR => linux_errno::ENODATA,
+        libc::EBADMSG => linux_errno::EBADMSG,
+        libc::EMULTIHOP => linux_errno::EMULTIHOP,
+        libc::ENODATA => linux_errno::ENODATA,
+        libc::ENOLINK => linux_errno::ENOLINK,
+        libc::ENOSR => linux_errno::ENOSR,
+        libc::ENOSTR => linux_errno::ENOSTR,
+        libc::EPROTO => linux_errno::EPROTO,
+        libc::ETIME => linux_errno::ETIME,
+        libc::ENOTRECOVERABLE => linux_errno::ENOTRECOVERABLE,
+        libc::EOWNERDEAD => linux_errno::EOWNERDEAD,
+        1..=34 => errno,
+        _ => libc::EIO,
+    }
+}
 const DIRENT_PADDING: [u8; 8] = [0; 8];
 
 const CURRENT_DIR_CSTR: &[u8] = b".";
@@ -507,8 +639,18 @@ impl<F: FileSystem + Sync> Server<F> {
     fn rename2(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let Rename2In { newdir, flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
+        // FUSE rename flags use Linux kernel values. Define compat constants for macOS.
+        #[cfg(target_os = "linux")]
         let flags =
             flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE | libc::RENAME_WHITEOUT);
+        #[cfg(target_os = "macos")]
+        let flags = {
+            // Linux constants: RENAME_NOREPLACE=1, RENAME_EXCHANGE=2, RENAME_WHITEOUT=4
+            const LINUX_RENAME_NOREPLACE: u32 = 1;
+            const LINUX_RENAME_EXCHANGE: u32 = 2;
+            const LINUX_RENAME_WHITEOUT: u32 = 4;
+            flags & (LINUX_RENAME_NOREPLACE | LINUX_RENAME_EXCHANGE | LINUX_RENAME_WHITEOUT)
+        };
 
         self.do_rename(in_header, size_of::<Rename2In>(), newdir, flags, r, w)
     }
@@ -1549,9 +1691,10 @@ fn strerror(error: i32) -> String {
 }
 
 fn reply_error(e: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
+    let native_errno = e.raw_os_error().unwrap_or(libc::EIO);
     let header = OutHeader {
         len: size_of::<OutHeader>() as u32,
-        error: -e.raw_os_error().unwrap_or(libc::EIO),
+        error: -errno_to_linux(native_errno),
         unique,
     };
 
@@ -1819,6 +1962,118 @@ mod tests {
         match err {
             Error::DecodeMessage(io_err) => assert_eq!(io_err.raw_os_error(), Some(libc::EINVAL)),
             other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    /// On Linux, errno values match the FUSE wire protocol — translation is a no-op.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn errno_to_linux_is_identity_on_linux() {
+        for v in [
+            libc::EPERM,
+            libc::ENOENT,
+            libc::EAGAIN,
+            libc::EOPNOTSUPP,
+            libc::ENETRESET,
+            libc::ECONNREFUSED,
+            libc::ENODATA,
+            libc::EOWNERDEAD,
+        ] {
+            assert_eq!(
+                errno_to_linux(v),
+                v,
+                "errno {v} should pass through on Linux"
+            );
+        }
+    }
+
+    /// macOS-side values that share the 1..=34 range with Linux (EPERM..ERANGE)
+    /// must pass through unchanged, except `EDEADLK` (Darwin 11, Linux 35).
+    /// Linux 11 is `EAGAIN`; Darwin `EAGAIN` is 35 and is remapped separately.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn errno_to_linux_low_range_is_identity() {
+        for v in 1..=34 {
+            if v == libc::EDEADLK {
+                assert_eq!(errno_to_linux(v), linux_errno::EDEADLK);
+                continue;
+            }
+            assert_eq!(
+                errno_to_linux(v),
+                v,
+                "errno {v} (low range) must pass through unchanged"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn errno_to_linux_table() {
+        use super::linux_errno as L;
+        let map = [
+            (libc::EAGAIN, L::EAGAIN),
+            (libc::EDEADLK, L::EDEADLK),
+            (libc::EINPROGRESS, L::EINPROGRESS),
+            (libc::EALREADY, L::EALREADY),
+            (libc::ENOTSOCK, L::ENOTSOCK),
+            (libc::EDESTADDRREQ, L::EDESTADDRREQ),
+            (libc::EMSGSIZE, L::EMSGSIZE),
+            (libc::EPROTOTYPE, L::EPROTOTYPE),
+            (libc::ENOPROTOOPT, L::ENOPROTOOPT),
+            (libc::EPROTONOSUPPORT, L::EPROTONOSUPPORT),
+            (libc::ESOCKTNOSUPPORT, L::ESOCKTNOSUPPORT),
+            (libc::ENOTSUP, L::EOPNOTSUPP),
+            (libc::EOPNOTSUPP, L::EOPNOTSUPP),
+            (libc::EPFNOSUPPORT, L::EPFNOSUPPORT),
+            (libc::EAFNOSUPPORT, L::EAFNOSUPPORT),
+            (libc::EADDRINUSE, L::EADDRINUSE),
+            (libc::EADDRNOTAVAIL, L::EADDRNOTAVAIL),
+            (libc::ENETDOWN, L::ENETDOWN),
+            (libc::ENETUNREACH, L::ENETUNREACH),
+            (libc::ENETRESET, L::ENETRESET),
+            (libc::ECONNABORTED, L::ECONNABORTED),
+            (libc::ECONNRESET, L::ECONNRESET),
+            (libc::ENOBUFS, L::ENOBUFS),
+            (libc::EISCONN, L::EISCONN),
+            (libc::ENOTCONN, L::ENOTCONN),
+            (libc::ESHUTDOWN, L::ESHUTDOWN),
+            (libc::ETOOMANYREFS, L::ETOOMANYREFS),
+            (libc::ETIMEDOUT, L::ETIMEDOUT),
+            (libc::ECONNREFUSED, L::ECONNREFUSED),
+            (libc::ELOOP, L::ELOOP),
+            (libc::ENAMETOOLONG, L::ENAMETOOLONG),
+            (libc::EHOSTDOWN, L::EHOSTDOWN),
+            (libc::EHOSTUNREACH, L::EHOSTUNREACH),
+            (libc::ENOTEMPTY, L::ENOTEMPTY),
+            (libc::EDQUOT, L::EDQUOT),
+            (libc::ESTALE, L::ESTALE),
+            (libc::ENOLCK, L::ENOLCK),
+            (libc::ENOSYS, L::ENOSYS),
+            (libc::EOVERFLOW, L::EOVERFLOW),
+            (libc::ECANCELED, L::ECANCELED),
+            (libc::EIDRM, L::EIDRM),
+            (libc::ENOMSG, L::ENOMSG),
+            (libc::EILSEQ, L::EILSEQ),
+            (libc::ENOATTR, L::ENODATA),
+            (libc::EBADMSG, L::EBADMSG),
+            (libc::EMULTIHOP, L::EMULTIHOP),
+            (libc::ENODATA, L::ENODATA),
+            (libc::ENOLINK, L::ENOLINK),
+            (libc::ENOSR, L::ENOSR),
+            (libc::ENOSTR, L::ENOSTR),
+            (libc::EPROTO, L::EPROTO),
+            (libc::ETIME, L::ETIME),
+            (libc::ENOTRECOVERABLE, L::ENOTRECOVERABLE),
+            (libc::EOWNERDEAD, L::EOWNERDEAD),
+        ];
+        for (mac, linux) in map {
+            assert_eq!(errno_to_linux(mac), linux, "macos {mac} -> linux {linux}");
+        }
+        assert_eq!(libc::EOPNOTSUPP, 102);
+        assert_eq!(errno_to_linux(libc::EOPNOTSUPP), L::EOPNOTSUPP);
+        assert_eq!(errno_to_linux(libc::ENOATTR), L::ENODATA);
+        for v in [libc::EAUTH, libc::ENOPOLICY, libc::EQFULL] {
+            assert_eq!(errno_to_linux(v), libc::EIO, "macos-only {v} becomes EIO");
         }
     }
 }

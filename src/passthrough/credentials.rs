@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use crate::oslib;
+#[cfg(target_os = "linux")]
 use crate::passthrough::util::einval;
 use crate::soft_idmap::{HostGid, HostUid, Id};
 use std::io;
@@ -8,7 +9,9 @@ use std::io;
 pub struct UnixCredentials {
     uid: HostUid,
     gid: HostGid,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     sup_gids: Vec<HostGid>,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     keep_capability: bool,
 }
 
@@ -36,6 +39,7 @@ impl UnixCredentials {
 
     /// Changes the effective uid/gid of the current thread to `val`.  Changes
     /// the thread's credentials back to root when the returned struct is dropped.
+    #[cfg(target_os = "linux")]
     pub fn set(self) -> io::Result<UnixCredentialsGuard> {
         // Safe: Always succesful
         let current_uid = HostUid::from(unsafe { libc::geteuid() });
@@ -75,8 +79,36 @@ impl UnixCredentials {
             _sup_gids: sup_guard,
         })
     }
+
+    /// Changes the effective uid/gid of the current thread to `val`.  Changes
+    /// the thread's credentials back to the process's when the returned struct is dropped.
+    ///
+    /// macOS cannot give a thread its own supplementary groups: the thread gets those that the
+    /// directory service gives the uid, and the guest's (`sup_gids`) are not used.
+    #[cfg(target_os = "macos")]
+    pub fn set(self) -> io::Result<UnixCredentialsGuard> {
+        // Safe: Always succesful
+        let current_uid = HostUid::from(unsafe { libc::geteuid() });
+        let current_gid = HostGid::from(unsafe { libc::getegid() });
+
+        // Not to change UID/GID when they’re 0 (root) is legacy behavior that we’re afraid to
+        // change
+        let change_uid = !self.uid.is_root() && self.uid != current_uid;
+        let change_gid = !self.gid.is_root() && self.gid != current_gid;
+        if !change_uid && !change_gid {
+            return Ok(UnixCredentialsGuard { _thread: None });
+        }
+
+        // The uid and gid can only be set together.
+        let uid = if change_uid { self.uid } else { current_uid };
+        let gid = if change_gid { self.gid } else { current_gid };
+        Ok(UnixCredentialsGuard {
+            _thread: Some(ScopedThreadCredentials::new(uid, gid)?),
+        })
+    }
 }
 
+#[cfg(target_os = "linux")]
 macro_rules! scoped_id {
     ($name:ident, $id_type:ty, $set_fn:path, $label:literal) => {
         struct $name($id_type);
@@ -98,11 +130,15 @@ macro_rules! scoped_id {
     };
 }
 
+#[cfg(target_os = "linux")]
 scoped_id!(ScopedUid, HostUid, oslib::seteffuid, "uid");
+#[cfg(target_os = "linux")]
 scoped_id!(ScopedGid, HostGid, oslib::seteffgid, "gid");
 
+#[cfg(target_os = "linux")]
 struct ScopedSupGids;
 
+#[cfg(target_os = "linux")]
 impl ScopedSupGids {
     fn new(gids: &[HostGid]) -> io::Result<Option<Self>> {
         if gids.is_empty() {
@@ -113,6 +149,7 @@ impl ScopedSupGids {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for ScopedSupGids {
     fn drop(&mut self) {
         oslib::dropsupgroups().unwrap_or_else(|e| {
@@ -122,16 +159,43 @@ impl Drop for ScopedSupGids {
 }
 
 // Dropped in declaration order
+#[cfg(target_os = "linux")]
 pub struct UnixCredentialsGuard {
     _uid: Option<ScopedUid>,
     _gid: Option<ScopedGid>,
     _sup_gids: Option<ScopedSupGids>,
 }
 
+#[cfg(target_os = "macos")]
+pub struct UnixCredentialsGuard {
+    _thread: Option<ScopedThreadCredentials>,
+}
+
+#[cfg(target_os = "macos")]
+struct ScopedThreadCredentials;
+
+#[cfg(target_os = "macos")]
+impl ScopedThreadCredentials {
+    fn new(uid: HostUid, gid: HostGid) -> io::Result<Self> {
+        oslib::set_thread_credentials(uid, gid)?;
+        Ok(ScopedThreadCredentials)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ScopedThreadCredentials {
+    fn drop(&mut self) {
+        // A thread that keeps another identity cannot take a new one, so this must not fail.
+        oslib::revert_thread_credentials().expect("failed to change the thread's credentials back");
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub struct ScopedCaps {
     cap: capng::Capability,
 }
 
+#[cfg(target_os = "linux")]
 impl ScopedCaps {
     fn new(cap_name: &str) -> io::Result<Option<Self>> {
         use capng::{Action, CUpdate, Set, Type};
@@ -163,6 +227,7 @@ impl ScopedCaps {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for ScopedCaps {
     fn drop(&mut self) {
         use capng::{Action, CUpdate, Set, Type};
@@ -185,6 +250,17 @@ impl Drop for ScopedCaps {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn drop_effective_cap(cap_name: &str) -> io::Result<Option<ScopedCaps>> {
     ScopedCaps::new(cap_name)
+}
+
+/// macOS has no capabilities.  The callers drop `FSETID` for `killpriv_v2`, which is never enabled
+/// on macOS.
+#[cfg(target_os = "macos")]
+pub struct ScopedCaps;
+
+#[cfg(target_os = "macos")]
+pub fn drop_effective_cap(_cap_name: &str) -> io::Result<Option<ScopedCaps>> {
+    Ok(None)
 }

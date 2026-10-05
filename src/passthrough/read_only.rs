@@ -9,6 +9,10 @@
 //! [`FileSystem`] and [`SerializableFileSystem`] traits, so can be used as a virtiofsd filesystem
 //! driver.
 
+#[cfg(target_os = "macos")]
+use crate::libc_compat as libc;
+
+use super::open_flags::linux;
 use super::util::{einval, erofs};
 use super::PassthroughFs;
 use crate::filesystem::{
@@ -57,13 +61,16 @@ impl PassthroughFsRo {
             .try_into()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
+        // `flags` are the guest's, i.e. Linux's, and the flags checked here have the same value on
+        // all Linux architectures.
+
         // `O_PATH` ignores all flags but `O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW`, just allow it
-        // wholesale
-        if cflags & libc::O_PATH != 0 {
+        // wholesale (on Linux; other hosts have no `O_PATH`, so the other flags would be used)
+        if cfg!(target_os = "linux") && cflags & linux::O_PATH != 0 {
             return open_fn(flags);
         }
 
-        if cflags & libc::O_ACCMODE != libc::O_RDONLY {
+        if cflags & linux::O_ACCMODE != linux::O_RDONLY {
             return Err(erofs());
         }
 
@@ -89,7 +96,7 @@ impl PassthroughFsRo {
 
         // Note that at least `O_TMPFILE` occupies multiple bits, so we need to check exactly.  Do
         // it for the other flags, too, why not.
-        if cflags & libc::O_EXCL == libc::O_EXCL {
+        if cflags & linux::O_EXCL == linux::O_EXCL {
             // O_EXCL is undefined without O_CREAT (which we filter out below).  Then again, on a
             // read-only filesystem, O_CREAT | O_EXCL will always return an error, so we can just
             // do that here.  Maybe we should check whether to return EROFS or EEXIST, depending on
@@ -98,22 +105,22 @@ impl PassthroughFsRo {
             // (And it’s also weird to use O_CREAT | O_EXCL | O_RDONLY.)
             return Err(erofs());
         }
-        if cflags & libc::O_TMPFILE == libc::O_TMPFILE {
+        if cflags & linux::__O_TMPFILE == linux::__O_TMPFILE {
             // O_TMPFILE | O_RDONLY should have already resulted in EINVAL in the guest, but better
             // safeguard it explicitly.
             return Err(einval());
         }
-        if cflags & libc::O_TRUNC == libc::O_TRUNC {
+        if cflags & linux::O_TRUNC == linux::O_TRUNC {
             // Undefined with O_RDONLY, so we can do what we want.  We need to error out, though,
             // lest passing it to the host will truncate the file even with O_RDONLY.
             return Err(einval());
         }
 
-        if cflags & libc::O_CREAT == 0 {
+        if cflags & linux::O_CREAT == 0 {
             open_fn(flags)
         } else {
             // Try to open without CREAT, if that fails, return EROFS
-            open_fn(flags & !(libc::O_CREAT as u32)).map_err(|err| {
+            open_fn(flags & !(linux::O_CREAT as u32)).map_err(|err| {
                 if err.kind() == io::ErrorKind::NotFound {
                     erofs()
                 } else {
